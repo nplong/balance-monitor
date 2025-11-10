@@ -47,8 +47,32 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+# ==================== HELPER FUNCTIONS ====================
+def get_previous_balance(account_label, account_number):
+    """Get the most recent balance for an account from database"""
+    try:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT balance 
+            FROM balance_history 
+            WHERE account_label = ? AND account_number = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+        ''', (account_label, account_number))
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        return result[0] if result else None
+        
+    except Exception as e:
+        print(f"✗ Error getting previous balance: {str(e)}")
+        return None
+
 # ==================== TELEGRAM MODULE ====================
-def send_to_telegram(payload):
+def send_to_telegram(payload, previous_balance=None):
     """Send balance update notification to Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️  Telegram not configured - skipping notification")
@@ -56,29 +80,19 @@ def send_to_telegram(payload):
         
     try:
         account_label = payload.get('account_label', 'Unknown')
-        account_number = payload.get('account_number', 'N/A')
         new_balance = payload.get('new_balance', 0.0)
-        event_type = payload.get('event_type', 'UPDATE')
-        timestamp = payload.get('timestamp', 'N/A')
-        broker = payload.get('broker', 'N/A')
-        currency = payload.get('currency', 'USD')
         
-        message = f"""
-🔔 <b>Balance Update Detected</b>
-
-📊 <b>Account:</b> {account_label}
-#🔢 <b>Number:</b> {account_number}
-💰 <b>New Balance:</b> {currency} {new_balance:,.2f}
-#⚡ <b>Event:</b> {event_type}
-#🏢 <b>Broker:</b> {broker}
-#🕐 <b>Time:</b> {timestamp}
-        """
+        # Format message: Account label // previous --> current
+        if previous_balance is not None:
+            message = f"{account_label} // {previous_balance:,.2f} --> {new_balance:,.2f}"
+        else:
+            # First time - no previous balance
+            message = f"{account_label} // {new_balance:,.2f}"
         
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": message.strip(),
-            "parse_mode": "HTML"
+            "text": message
         }
         
         response = requests.post(url, json=data, timeout=10)
@@ -143,7 +157,16 @@ def balance_update():
         print(f"Time: {payload.get('timestamp')}")
         print("="*60 + "\n")
         
-        telegram_success = send_to_telegram(payload)
+        # Get previous balance from database
+        previous_balance = get_previous_balance(
+            payload.get('account_label'),
+            payload.get('account_number')
+        )
+        
+        # Send to Telegram with previous balance
+        telegram_success = send_to_telegram(payload, previous_balance)
+        
+        # Log to Database
         db_success = log_to_database(payload)
         
         return jsonify({
@@ -277,4 +300,3 @@ if __name__ == '__main__':
     print("="*60 + "\n")
     
     app.run(host='0.0.0.0', port=port, debug=False)
-
