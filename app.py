@@ -67,11 +67,11 @@ def send_to_telegram(payload):
 🔔 <b>Balance Update Detected</b>
 
 📊 <b>Account:</b> {account_label}
-🔢 <b>Number:</b> {account_number}
+#🔢 <b>Number:</b> {account_number}
 💰 <b>New Balance:</b> {currency} {new_balance:,.2f}
-⚡ <b>Event:</b> {event_type}
-🏢 <b>Broker:</b> {broker}
-🕐 <b>Time:</b> {timestamp}
+#⚡ <b>Event:</b> {event_type}
+#🏢 <b>Broker:</b> {broker}
+#🕐 <b>Time:</b> {timestamp}
         """
         
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -277,3 +277,4 @@ if __name__ == '__main__':
     print("="*60 + "\n")
     
     app.run(host='0.0.0.0', port=port, debug=False)
+
