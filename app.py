@@ -1,9 +1,9 @@
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from datetime import datetime
-import sqlite3
 import requests
 import os
 from functools import wraps
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
@@ -12,31 +12,86 @@ app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-producti
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 DASHBOARD_PASSWORD = os.environ.get('DASHBOARD_PASSWORD', 'admin123')
-DATABASE_NAME = "balance_monitor.db"
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+
+# Detect database type
+USE_POSTGRES = bool(DATABASE_URL and 'postgres' in DATABASE_URL)
+
+if USE_POSTGRES:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    print("📊 Using PostgreSQL database")
+else:
+    import sqlite3
+    DATABASE_NAME = "balance_monitor.db"
+    print("📊 Using SQLite database")
+
+# ==================== DATABASE CONNECTION ====================
+def get_db_connection():
+    """Get database connection based on environment"""
+    if USE_POSTGRES:
+        # Fix for Railway PostgreSQL connection string
+        url = DATABASE_URL.replace('postgres://', 'postgresql://')
+        return psycopg2.connect(url)
+    else:
+        return sqlite3.connect(DATABASE_NAME)
 
 # ==================== DATABASE SETUP ====================
 def init_database():
-    """Initialize SQLite database"""
-    conn = sqlite3.connect(DATABASE_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS balance_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            account_label TEXT NOT NULL,
-            account_number TEXT NOT NULL,
-            balance REAL NOT NULL,
-            event_type TEXT,
-            broker TEXT,
-            currency TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    print("✓ Database initialized successfully")
+    """Initialize database with proper schema"""
+    try:
+        if USE_POSTGRES:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS balance_history (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMP NOT NULL,
+                    account_label VARCHAR(255) NOT NULL,
+                    account_number VARCHAR(50) NOT NULL,
+                    balance DECIMAL(15, 2) NOT NULL,
+                    event_type VARCHAR(50),
+                    broker VARCHAR(255),
+                    currency VARCHAR(10),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Create index for faster queries
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_account_label 
+                ON balance_history(account_label, account_number, created_at DESC)
+            ''')
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print("✓ PostgreSQL database initialized successfully")
+        else:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS balance_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    account_label TEXT NOT NULL,
+                    account_number TEXT NOT NULL,
+                    balance REAL NOT NULL,
+                    event_type TEXT,
+                    broker TEXT,
+                    currency TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            print("✓ SQLite database initialized successfully")
+            
+    except Exception as e:
+        print(f"✗ Database initialization error: {str(e)}")
 
 # ==================== AUTHENTICATION ====================
 def login_required(f):
@@ -51,21 +106,35 @@ def login_required(f):
 def get_previous_balance(account_label, account_number):
     """Get the most recent balance for an account from database"""
     try:
-        conn = sqlite3.connect(DATABASE_NAME)
-        cursor = conn.cursor()
+        conn = get_db_connection()
         
-        cursor.execute('''
-            SELECT balance 
-            FROM balance_history 
-            WHERE account_label = ? AND account_number = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-        ''', (account_label, account_number))
+        if USE_POSTGRES:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute('''
+                SELECT balance 
+                FROM balance_history 
+                WHERE account_label = %s AND account_number = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+            ''', (account_label, account_number))
+        else:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT balance 
+                FROM balance_history 
+                WHERE account_label = ? AND account_number = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            ''', (account_label, account_number))
         
         result = cursor.fetchone()
+        cursor.close()
         conn.close()
         
-        return result[0] if result else None
+        if USE_POSTGRES:
+            return result['balance'] if result else None
+        else:
+            return result[0] if result else None
         
     except Exception as e:
         print(f"✗ Error getting previous balance: {str(e)}")
@@ -86,7 +155,6 @@ def send_to_telegram(payload, previous_balance=None):
         if previous_balance is not None:
             message = f"{account_label} // {previous_balance:,.2f} --> {new_balance:,.2f}"
         else:
-            # First time - no previous balance
             message = f"{account_label} // {new_balance:,.2f}"
         
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -112,24 +180,44 @@ def send_to_telegram(payload, previous_balance=None):
 def log_to_database(payload):
     """Log balance update to database"""
     try:
-        conn = sqlite3.connect(DATABASE_NAME)
-        cursor = conn.cursor()
+        # Ensure database exists
+        init_database()
         
-        cursor.execute('''
-            INSERT INTO balance_history 
-            (timestamp, account_label, account_number, balance, event_type, broker, currency)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            payload.get('timestamp'),
-            payload.get('account_label'),
-            payload.get('account_number'),
-            payload.get('new_balance'),
-            payload.get('event_type'),
-            payload.get('broker'),
-            payload.get('currency')
-        ))
+        conn = get_db_connection()
+        
+        if USE_POSTGRES:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO balance_history 
+                (timestamp, account_label, account_number, balance, event_type, broker, currency)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ''', (
+                payload.get('timestamp'),
+                payload.get('account_label'),
+                payload.get('account_number'),
+                payload.get('new_balance'),
+                payload.get('event_type'),
+                payload.get('broker'),
+                payload.get('currency')
+            ))
+        else:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO balance_history 
+                (timestamp, account_label, account_number, balance, event_type, broker, currency)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                payload.get('timestamp'),
+                payload.get('account_label'),
+                payload.get('account_number'),
+                payload.get('new_balance'),
+                payload.get('event_type'),
+                payload.get('broker'),
+                payload.get('currency')
+            ))
         
         conn.commit()
+        cursor.close()
         conn.close()
         print("✓ Data logged to database successfully")
         return True
@@ -209,20 +297,34 @@ def dashboard():
 def get_accounts():
     """Get list of all accounts"""
     try:
-        conn = sqlite3.connect(DATABASE_NAME)
-        cursor = conn.cursor()
+        # Ensure database exists
+        init_database()
         
-        cursor.execute('''
-            SELECT DISTINCT account_label, account_number 
-            FROM balance_history 
-            ORDER BY account_label
-        ''')
+        conn = get_db_connection()
         
-        accounts = [{"label": row[0], "number": row[1]} for row in cursor.fetchall()]
+        if USE_POSTGRES:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute('''
+                SELECT DISTINCT account_label, account_number 
+                FROM balance_history 
+                ORDER BY account_label
+            ''')
+            accounts = [{"label": row['account_label'], "number": row['account_number']} for row in cursor.fetchall()]
+        else:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT DISTINCT account_label, account_number 
+                FROM balance_history 
+                ORDER BY account_label
+            ''')
+            accounts = [{"label": row[0], "number": row[1]} for row in cursor.fetchall()]
+        
+        cursor.close()
         conn.close()
         
         return jsonify(accounts)
     except Exception as e:
+        print(f"✗ Error getting accounts: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/history')
@@ -230,55 +332,87 @@ def get_accounts():
 def get_history():
     """Get balance history with optional filters"""
     try:
+        # Ensure database exists
+        init_database()
+        
         account_labels = request.args.get('accounts', '').split(',')
         start_date = request.args.get('start_date')
         end_date = request.args.get('end_date')
         
-        conn = sqlite3.connect(DATABASE_NAME)
-        cursor = conn.cursor()
+        conn = get_db_connection()
         
-        query = "SELECT timestamp, account_label, account_number, balance, event_type, broker, currency FROM balance_history WHERE 1=1"
-        params = []
+        if USE_POSTGRES:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            query = "SELECT timestamp, account_label, account_number, balance, event_type, broker, currency FROM balance_history WHERE 1=1"
+            params = []
+            
+            if account_labels and account_labels[0]:
+                placeholders = ','.join(['%s'] * len(account_labels))
+                query += f" AND account_label IN ({placeholders})"
+                params.extend(account_labels)
+            
+            if start_date:
+                query += " AND timestamp >= %s"
+                params.append(start_date)
+            if end_date:
+                query += " AND timestamp <= %s"
+                params.append(end_date + " 23:59:59")
+            
+            query += " ORDER BY timestamp ASC"
+            cursor.execute(query, params)
+            
+            history = [dict(row) for row in cursor.fetchall()]
+            
+        else:
+            cursor = conn.cursor()
+            query = "SELECT timestamp, account_label, account_number, balance, event_type, broker, currency FROM balance_history WHERE 1=1"
+            params = []
+            
+            if account_labels and account_labels[0]:
+                placeholders = ','.join(['?'] * len(account_labels))
+                query += f" AND account_label IN ({placeholders})"
+                params.extend(account_labels)
+            
+            if start_date:
+                query += " AND timestamp >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND timestamp <= ?"
+                params.append(end_date + " 23:59:59")
+            
+            query += " ORDER BY timestamp ASC"
+            cursor.execute(query, params)
+            
+            history = []
+            for row in cursor.fetchall():
+                history.append({
+                    "timestamp": row[0],
+                    "account_label": row[1],
+                    "account_number": row[2],
+                    "balance": row[3],
+                    "event_type": row[4],
+                    "broker": row[5],
+                    "currency": row[6]
+                })
         
-        if account_labels and account_labels[0]:
-            placeholders = ','.join('?' * len(account_labels))
-            query += f" AND account_label IN ({placeholders})"
-            params.extend(account_labels)
-        
-        if start_date:
-            query += " AND timestamp >= ?"
-            params.append(start_date)
-        if end_date:
-            query += " AND timestamp <= ?"
-            params.append(end_date + " 23:59:59")
-        
-        query += " ORDER BY timestamp ASC"
-        
-        cursor.execute(query, params)
-        
-        history = []
-        for row in cursor.fetchall():
-            history.append({
-                "timestamp": row[0],
-                "account_label": row[1],
-                "account_number": row[2],
-                "balance": row[3],
-                "event_type": row[4],
-                "broker": row[5],
-                "currency": row[6]
-            })
-        
+        cursor.close()
         conn.close()
         return jsonify(history)
         
     except Exception as e:
+        print(f"✗ Error getting history: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 # ==================== HEALTH CHECK ====================
 @app.route('/health')
 def health():
     """Health check endpoint"""
-    return jsonify({"status": "healthy", "service": "balance-monitor"}), 200
+    db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
+    return jsonify({
+        "status": "healthy", 
+        "service": "balance-monitor",
+        "database": db_type
+    }), 200
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
@@ -289,11 +423,10 @@ if __name__ == '__main__':
     init_database()
     
     print("\n⚙️  Configuration:")
+    print(f"   Database: {'PostgreSQL ✓' if USE_POSTGRES else 'SQLite'}")
     print(f"   Telegram Bot: {'✓ Configured' if TELEGRAM_BOT_TOKEN else '✗ NOT CONFIGURED'}")
     print(f"   Dashboard Password: {DASHBOARD_PASSWORD}")
-    print(f"   Database: {DATABASE_NAME}")
     
-    # Railway uses PORT environment variable
     port = int(os.environ.get('PORT', 5000))
     
     print(f"\n🌐 Server starting on port {port}")
