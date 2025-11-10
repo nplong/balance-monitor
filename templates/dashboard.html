@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Balance Monitor Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+        .header {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            font-size: 28px;
+        }
+        .logout-btn {
+            background: #dc3545;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .control-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #555;
+        }
+        .checkbox-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        .checkbox-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        input[type="date"] {
+            padding: 8px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            margin-right: 10px;
+        }
+        button {
+            background: #667eea;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover { background: #5568d3; }
+        .chart-container {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            height: 600px;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📊 MT5 Balance Monitor Dashboard</h1>
+        <a href="/logout" class="logout-btn">Logout</a>
+    </div>
+
+    <div class="controls">
+        <div class="control-group">
+            <label>Select Accounts:</label>
+            <div class="checkbox-group" id="accountCheckboxes">
+                <div class="loading">Loading accounts...</div>
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label>Date Range:</label>
+            <input type="date" id="startDate">
+            <input type="date" id="endDate">
+            <button onclick="updateChart()">Update Chart</button>
+            <button onclick="resetFilters()">Reset</button>
+        </div>
+    </div>
+
+    <div class="chart-container">
+        <canvas id="balanceChart"></canvas>
+    </div>
+
+    <script>
+        let chart = null;
+        let accounts = [];
+
+        // Color palette for different accounts
+        const colors = [
+            '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
+            '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF'
+        ];
+
+        // Load accounts on page load
+        async function loadAccounts() {
+            try {
+                const response = await fetch('/api/accounts');
+                accounts = await response.json();
+                
+                const container = document.getElementById('accountCheckboxes');
+                container.innerHTML = '';
+                
+                accounts.forEach((account, index) => {
+                    const div = document.createElement('div');
+                    div.className = 'checkbox-item';
+                    div.innerHTML = `
+                        <input type="checkbox" id="acc_${index}" value="${account.label}" checked>
+                        <label for="acc_${index}">${account.label} (${account.number})</label>
+                    `;
+                    container.appendChild(div);
+                });
+                
+                // Set default date range (last 30 days)
+                const today = new Date();
+                const thirtyDaysAgo = new Date(today.getTime() - (30 * 24 * 60 * 60 * 1000));
+                document.getElementById('endDate').valueAsDate = today;
+                document.getElementById('startDate').valueAsDate = thirtyDaysAgo;
+                
+                // Initial chart load
+                updateChart();
+                
+            } catch (error) {
+                console.error('Error loading accounts:', error);
+            }
+        }
+
+        // Update chart with selected filters
+        async function updateChart() {
+            try {
+                // Get selected accounts
+                const selectedAccounts = [];
+                accounts.forEach((account, index) => {
+                    const checkbox = document.getElementById(`acc_${index}`);
+                    if (checkbox && checkbox.checked) {
+                        selectedAccounts.push(account.label);
+                    }
+                });
+
+                if (selectedAccounts.length === 0) {
+                    alert('Please select at least one account');
+                    return;
+                }
+
+                // Get date range
+                const startDate = document.getElementById('startDate').value;
+                const endDate = document.getElementById('endDate').value;
+
+                // Build query
+                const params = new URLSearchParams({
+                    accounts: selectedAccounts.join(','),
+                    start_date: startDate,
+                    end_date: endDate
+                });
+
+                const response = await fetch(`/api/history?${params}`);
+                const data = await response.json();
+
+                // Process data for Chart.js
+                const datasets = {};
+                
+                data.forEach(record => {
+                    if (!datasets[record.account_label]) {
+                        datasets[record.account_label] = {
+                            label: `${record.account_label} (${record.account_number})`,
+                            data: [],
+                            borderColor: colors[Object.keys(datasets).length % colors.length],
+                            backgroundColor: 'transparent',
+                            tension: 0.1
+                        };
+                    }
+                    
+                    datasets[record.account_label].data.push({
+                        x: record.timestamp,
+                        y: record.balance
+                    });
+                });
+
+                // Destroy existing chart
+                if (chart) {
+                    chart.destroy();
+                }
+
+                // Create new chart
+                const ctx = document.getElementById('balanceChart').getContext('2d');
+                chart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        datasets: Object.values(datasets)
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            title: {
+                                display: true,
+                                text: 'MT5 Account Balance History',
+                                font: { size: 18 }
+                            },
+                            legend: {
+                                display: true,
+                                position: 'top'
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: {
+                                    unit: 'day',
+                                    displayFormats: {
+                                        day: 'MMM dd, yyyy'
+                                    }
+                                },
+                                title: {
+                                    display: true,
+                                    text: 'Date & Time'
+                                }
+                            },
+                            y: {
+                                title: {
+                                    display: true,
+                                    text: 'Balance'
+                                },
+                                ticks: {
+                                    callback: function(value) {
+                                        return '$' + value.toLocaleString();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+            } catch (error) {
+                console.error('Error updating chart:', error);
+                alert('Error loading chart data');
+            }
+        }
+
+        // Reset filters
+        function resetFilters() {
+            accounts.forEach((account, index) => {
+                const checkbox = document.getElementById(`acc_${index}`);
+                if (checkbox) checkbox.checked = true;
+            });
+            
+            const today = new Date();
+            const thirtyDaysAgo = new Date(today.getTime() - (30 * 24 * 60 * 60 * 1000));
+            document.getElementById('endDate').valueAsDate = today;
+            document.getElementById('startDate').valueAsDate = thirtyDaysAgo;
+            
+            updateChart();
+        }
+
+        // Load accounts when page loads
+        window.onload = loadAccounts;
+    </script>
+</body>
+</html>
